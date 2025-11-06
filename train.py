@@ -15,7 +15,7 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ.setdefault("TRANSFORMERS_NO_MEMORY_WARMUP", "1")
 # Help CUDA memory fragmentation during big model loads
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-max_seq_length = 16284
+max_seq_length = 12288
 # The FP8 variant requires GPUs with compute capability >= 8.9 (e.g., H100/4090).
 # A100 is 8.0, so use a non-FP8 checkpoint.
 model_name = "Kwaipilot/KAT-Dev"
@@ -61,7 +61,7 @@ model = FastLanguageModel.get_peft_model(
     r=16,
     lora_alpha=32,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
+    lora_dropout=0.0,
     bias="none",
   #  use_gradient_checkpointing="unsloth",
 )
@@ -142,8 +142,8 @@ dataset = dataset.map(formatting_cpt, batched=True, remove_columns=dataset.colum
 dataset = dataset.map(chunk_long_texts, batched=True, num_proc=1)
 
 # Fixed hyperparameters (edit these as needed)
-batch_size_per_gpu = 4
-grad_accum = 2
+batch_size_per_gpu = 2
+grad_accum = 4
 learning_rate = 5e-5
 num_epochs = 2
 warmup_ratio = 0.03

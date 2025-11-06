@@ -13,8 +13,8 @@
   "bf16": {
     "enabled": true
   },
-  "gradient_accumulation_steps": 2,
-  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 4,
+  "train_micro_batch_size_per_gpu": 2,
   "gradient_clipping": 0.6,
   "wall_clock_breakdown": false
 }
