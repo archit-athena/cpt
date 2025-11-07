@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional
 from datasets import Dataset, load_dataset, load_from_disk
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
+try:
+    # vLLM LoRA request (available in recent versions)
+    from vllm.lora import LoraRequest  # type: ignore
+except Exception:  # pragma: no cover - older vLLM without LoRA utilities
+    LoraRequest = None  # type: ignore
 
 # ---------- Constants ----------
 SYSTEM_PROMPT = (
@@ -144,7 +149,8 @@ def evaluate_with_vllm(
     temperature: float = 0.8,
     top_p: float = 0.95,
     max_tokens: int = 2048,
-    max_model_len: int = 16192
+    max_model_len: int = 16192,
+    lora_request: Optional[Any] = None,
 ) -> List[ExampleResult]:
     """
     Evaluate using vLLM with n samples per example.
@@ -155,7 +161,7 @@ def evaluate_with_vllm(
     logging.info(f"Generating {n} predictions per example for {limit} examples")
 
     # Calculate max prompt length (reserve space for response)
-    max_prompt_tokens =  2048 # bigger buffer
+    max_prompt_tokens =  4096 # bigger buffer
 
     # Get tokenizer from llm
     tokenizer = llm.get_tokenizer()
@@ -218,7 +224,11 @@ def evaluate_with_vllm(
     )
 
     logging.info("Generating predictions with vLLM...")
-    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    # If a LoRA adapter is requested, pass it to vLLM
+    if lora_request is not None:
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True, lora_request=lora_request)
+    else:
+        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
 
     # Process outputs
     for idx, (output, example) in enumerate(zip(outputs, examples)):
@@ -344,6 +354,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tensor_parallel", type=int, default=4, help="Tensor parallel size (for multi-GPU)")
     p.add_argument("--output", type=Path, default=Path("eval_passn_results.json"), help="Output file")
     p.add_argument("--pass_k", type=str, default="1,3,8", help="Comma-separated k values for pass@k")
+    # LoRA options
+    p.add_argument("--lora_path", type=str, default=None, help="Local path to a LoRA adapter directory")
+    p.add_argument("--lora_name", type=str, default="lora", help="Name/id to assign to the LoRA adapter")
+    p.add_argument("--max_loras", type=int, default=1, help="Max number of LoRA adapters to host")
+    p.add_argument("--max_lora_rank", type=int, default=64, help="Max LoRA rank to support")
     return p.parse_args()
 
 
@@ -364,6 +379,11 @@ def main() -> None:
     logging.info(f"Initializing vLLM with model: {args.model}")
     logging.info(f"Tensor parallel size: {args.tensor_parallel}")
 
+    enable_lora = bool(args.lora_path)
+    if enable_lora and LoraRequest is None:
+        logging.warning("vLLM LoRA utilities not found; proceeding without LoRA.")
+        enable_lora = False
+
     llm = LLM(
         model=args.model,
         tokenizer=args.tokenizer if args.tokenizer else args.model,
@@ -372,7 +392,20 @@ def main() -> None:
         max_model_len=16192,
         gpu_memory_utilization=0.9,
         max_num_seqs=256,  # Process up to 256 sequences in parallel
+        enable_lora=enable_lora,
+        max_loras=args.max_loras if enable_lora else None,
+        max_lora_rank=args.max_lora_rank if enable_lora else None,
     )
+
+    lora_request = None
+    if enable_lora and args.lora_path:
+        try:
+            # lora_int_id is an arbitrary positive int identifying this adapter within vLLM
+            lora_request = LoraRequest(args.lora_name, args.lora_path, 1) if LoraRequest else None
+            logging.info(f"Loaded LoRA adapter '{args.lora_name}' from {args.lora_path}")
+        except Exception as e:
+            logging.warning(f"Failed to prepare LoRA adapter from {args.lora_path}: {e}")
+            lora_request = None
 
     # Run evaluation
     results = evaluate_with_vllm(
@@ -383,7 +416,8 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_tokens,
-        max_model_len=8192
+        max_model_len=8192,
+        lora_request=lora_request,
     )
 
     # Aggregate and display metrics

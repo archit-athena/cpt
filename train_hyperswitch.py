@@ -1,7 +1,7 @@
 import os
 import torch
 from unsloth import FastLanguageModel
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from trl import SFTTrainer, SFTConfig
 
 
@@ -34,7 +34,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     offload_state_dict=True,
 )
 
-# LoRA config (match existing)
+# LoRA config
 model = FastLanguageModel.get_peft_model(
     model,
     r=16,
@@ -46,8 +46,7 @@ model = FastLanguageModel.get_peft_model(
 
 EOS_TOKEN = tokenizer.eos_token or ""
 
-# Optional: enable Fill-in-the-Middle (FIM) formatting when dataset provides
-# prefix/middle/suffix fields. We add common FIM tokens if missing.
+# Add FIM tokens if needed
 USE_FIM = True
 FIM_TOKENS = ["<fim_prefix>", "<fim_middle>", "<fim_suffix>"]
 if USE_FIM:
@@ -61,34 +60,32 @@ if USE_FIM:
 
 
 def formatting_examples(examples):
+    """
+    Normalize datasets that only provide a single 'text' column.
+    - Ensures each entry ends with EOS.
+    - Keeps any existing FIM markers intact if present in text.
+    """
+    # Support datasets that provide either 'text' or 'content'
+    raw_texts = examples.get("text")
+    if raw_texts is None:
+        raw_texts = examples.get("content", [])
     texts = []
-    keys = set(examples.keys())
-
-    # Prefer FIM when prefix/middle/suffix exist and USE_FIM is True
-    if USE_FIM and {"prefix", "suffix"}.issubset(keys) and ("middle" in keys or "target" in keys):
-        middles = examples.get("middle") or examples.get("target") or [None] * len(examples["prefix"])
-        for pre, mid, suf in zip(examples["prefix"], middles, examples["suffix"]):
-            pre = (pre or "").rstrip()
-            mid = (mid or "").rstrip()
-            suf = (suf or "").rstrip()
-            # <fim_prefix> P <fim_suffix> S <fim_middle> M
-            texts.append(f"<fim_prefix>{pre}<fim_suffix>{suf}<fim_middle>{mid}")
-    elif "text" in examples:
-        for t in examples["text"]:
-            texts.append((t or "").rstrip())
-    else:
-        # Fallback: join visible columns into text
-        order = list(keys)
-        n = len(examples[order[0]])
-        for i in range(n):
-            row = []
-            for k in order:
-                row.append(str(examples[k][i]))
-            texts.append("\n".join(row).rstrip())
+    for content in raw_texts:
+        if content is None:
+            continue
+        content = content.rstrip()
+        # Only append EOS if the example doesn't already end with EOS or <|endoftext|>
+        if not content.endswith(EOS_TOKEN) and not content.endswith("<|endoftext|>"):
+            content += EOS_TOKEN
+        texts.append(content)
     return {"text": texts}
 
 
 def chunk_long_texts(examples):
+    """
+    Chunk texts that exceed max_seq_length.
+    Preserves FIM formatting, only chunks CLM samples.
+    """
     chunks = []
     max_chunk_tokens = max_seq_length - 1
     eos_id = tokenizer.eos_token_id
@@ -96,82 +93,193 @@ def chunk_long_texts(examples):
     for text in examples["text"]:
         if not text:
             continue
+        
+        # Tokenize to check length
         ids = tokenizer.encode(text, add_special_tokens=False)
-        if eos_id is not None:
-            if not ids or ids[-1] != eos_id:
-                ids.append(eos_id)
-        else:
-            # Fall back to string eos
-            chunks.append(text + (EOS_TOKEN if EOS_TOKEN and not text.endswith(EOS_TOKEN) else ""))
+        
+        # If within limit, keep as-is
+        if len(ids) <= max_chunk_tokens:
+            chunks.append(text)
             continue
-
+        
+        # Handle FIM samples - don't chunk them (would break format)
+        if '<fim_prefix>' in text or '<fim_middle>' in text or '<fim_suffix>' in text:
+            # Truncate FIM samples instead of chunking
+            truncated_ids = ids[:max_chunk_tokens]
+            
+            # Try to end at a reasonable point
+            decoded = tokenizer.decode(truncated_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            
+            # Ensure proper FIM closure if truncated
+            if '<fim_middle>' in decoded and not decoded.endswith('<|endoftext|>'):
+                decoded += '<|endoftext|>'
+            
+            chunks.append(decoded)
+            continue
+        
+        # Chunk CLM samples
         for start in range(0, len(ids), max_chunk_tokens):
-            part = ids[start:start + max_chunk_tokens]
-            if not part:
+            part_ids = ids[start:start + max_chunk_tokens]
+            if not part_ids:
                 continue
-            if eos_id is not None and part[-1] != eos_id:
-                part.append(eos_id)
-            chunks.append(tokenizer.decode(part, skip_special_tokens=False, clean_up_tokenization_spaces=False))
+            
+            # Decode chunk
+            chunk_text = tokenizer.decode(part_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            
+            # Ensure EOS at end of each chunk
+            if eos_id is not None:
+                # Check if last token is EOS
+                if part_ids[-1] != eos_id:
+                    chunk_text = chunk_text.rstrip()
+                    if not chunk_text.endswith(EOS_TOKEN):
+                        chunk_text += EOS_TOKEN
+            
+            chunks.append(chunk_text)
 
     return {"text": chunks}
 
 
-# Load the hyperswitch code dataset
-ds = load_dataset("archit11/hyperswitch-code-dataset")
-train_ds = ds["train"] if isinstance(ds, dict) and "train" in ds else ds
-train_ds = train_ds.map(formatting_examples, batched=True, remove_columns=train_ds.column_names)
-train_ds = train_ds.map(chunk_long_texts, batched=True, num_proc=1)
+# Load dataset
+print("Loading dataset...")
+ds = load_dataset("archit11/hyperswitch-token-aware-cpt-fixed")
 
+# Create train/eval split for evaluation loss
+if isinstance(ds, DatasetDict):
+    if "validation" in ds:
+        train_raw, eval_raw = ds["train"], ds["validation"]
+    elif "test" in ds:
+        train_raw, eval_raw = ds["train"], ds["test"]
+    else:
+        split = ds["train"].train_test_split(test_size=0.01, seed=42)
+        train_raw, eval_raw = split["train"], split["test"]
+else:
+    split = ds.train_test_split(test_size=0.01, seed=42)
+    train_raw, eval_raw = split["train"], split["test"]
 
-# Training config — same overall settings, adjusted for ZeRO-3
-batch_size_per_gpu = 2
+print(f"Original train size: {len(train_raw)} | eval size: {len(eval_raw)}")
+print(f"Train columns: {train_raw.column_names}")
+
+# Format samples (handles type-specific processing)
+print("Formatting samples (train/eval)...")
+train_ds = train_raw.map(
+    formatting_examples,
+    batched=True,
+    # Drop all original columns; mapper returns only 'text'
+    remove_columns=train_raw.column_names,
+    desc="Formatting train"
+)
+eval_ds = eval_raw.map(
+    formatting_examples,
+    batched=True,
+    remove_columns=eval_raw.column_names,
+    desc="Formatting eval"
+)
+
+# Chunk long sequences
+print("Chunking long sequences (train/eval)...")
+train_ds = train_ds.map(
+    chunk_long_texts,
+    batched=True,
+    remove_columns=[],
+    num_proc=1,
+    desc="Chunking train"
+)
+eval_ds = eval_ds.map(
+    chunk_long_texts,
+    batched=True,
+    remove_columns=[],
+    num_proc=1,
+    desc="Chunking eval"
+)
+
+print(f"Final sizes after chunking -> train: {len(train_ds)} | eval: {len(eval_ds)}")
+
+# Verify samples
+print("\nSample verification (train):")
+sample = train_ds[0]
+print(f"Sample text length: {len(sample['text'])} chars")
+print(f"Sample tokens: {len(tokenizer.encode(sample['text']))}")
+print(f"First 200 chars: {sample['text'][:200]}")
+
+# Training config with stability improvements
+batch_size_per_gpu = 1
 grad_accum = 4
-learning_rate = 5e-5
+learning_rate = 2e-5  # Reduced from 5e-5 for stability
 num_epochs = 2
-warmup_ratio = 0.03
+warmup_steps = 50  # Using steps instead of ratio for more control
 
 training_args = SFTConfig(
     gradient_accumulation_steps=grad_accum,
     per_device_train_batch_size=batch_size_per_gpu,
+    per_device_eval_batch_size=batch_size_per_gpu,
     num_train_epochs=num_epochs,
     learning_rate=learning_rate,
-    gradient_checkpointing=True,
+    
+    # Stability improvements
+    max_grad_norm=0.5,  # Reduced from 1.0
+    warmup_steps=warmup_steps,
+    
+    # Gradient checkpointing with more stable config
+    gradient_checkpointing=False,
+    #gradient_checkpointing_kwargs={"use_reentrant": False},
+    
     bf16=True,
     logging_steps=1,
     optim="adamw_torch",
     weight_decay=0.01,
-    lr_scheduler_type="cosine",
+    lr_scheduler_type="linear",
     seed=42,
     output_dir="outputs-hyperswitch-lora",
     report_to="wandb",
     save_strategy="steps",
-    save_steps=500,
+    save_steps=40,
+    eval_strategy="steps",
+    eval_steps=20,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
     max_seq_length=max_seq_length,
     dataset_num_proc=8,
-    packing=False,
+    packing=False,  # Important: packing can break FIM samples
+    
     dataloader_num_workers=4,
     dataloader_pin_memory=True,
     dataloader_prefetch_factor=4,
+    
     ddp_find_unused_parameters=False,
     deepspeed="ds_zero3.json",
-    warmup_ratio=warmup_ratio,
-    max_grad_norm=0.6,
 )
 
-print("Training hyperparameters:")
+print("\n" + "="*60)
+print("Training Configuration")
+print("="*60)
+print(f"  Model: {model_name}")
+print(f"  Max sequence length: {max_seq_length}")
 print(f"  Learning rate: {learning_rate:.2e}")
 print(f"  Batch size per GPU: {batch_size_per_gpu}")
 print(f"  Gradient accumulation: {grad_accum}")
-print(f"  Warmup ratio: {warmup_ratio}")
+print(f"  Effective batch size: {batch_size_per_gpu * grad_accum}")
+print(f"  Warmup steps: {warmup_steps}")
+print(f"  Max grad norm: {training_args.max_grad_norm}")
+print(f"  Epochs: {num_epochs}")
+print(f"  Dataset size: {len(train_ds)}")
+print("="*60 + "\n")
 
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     train_dataset=train_ds,
+    eval_dataset=eval_ds,
     args=training_args,
 )
 
+# Start training
+print("Starting training...")
 trainer.train()
 
+# Save final model
+print("\nSaving model...")
 model.save_pretrained("hyperswitch_lora")
 tokenizer.save_pretrained("hyperswitch_lora")
+
+print("✅ Training complete!")

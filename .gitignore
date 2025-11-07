@@ -5,3 +5,10 @@ __pycache__/
 .venv/
 wandb/
 prime-environments/
+outputs-hyperswitch-lora/
+outputs/
+outputs-16k/
+outputs-16k-lora/
+unsloth_compile_cache/
+prime_environments/
+hyperswitch_lora/
